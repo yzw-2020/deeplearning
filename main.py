@@ -1,4 +1,5 @@
 import argparse
+from calendar import c
 import os
 import random
 import shutil
@@ -19,6 +20,7 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+from torch.utils.tensorboard.writer import SummaryWriter
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -75,6 +77,12 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'N processes per node, which has N GPUs. This is the '
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
+parser.add_argument('--scale', default=0.08, type=float,
+                    help='scale to use.')
+parser.add_argument('--save-dir', default='.', type=str,
+                    help='folder to save checkpoints.')
+parser.add_argument('--save-freq', default=10, type=int,
+                    help='save frequency (default: 10)')
 
 best_acc1 = 0
 
@@ -118,6 +126,8 @@ def main_worker(gpu, ngpus_per_node, args):
     global best_acc1
     args.gpu = gpu
 
+    writer = Writer(f'./runs/{args.scale}/')
+
     if args.gpu is not None:
         print("Use GPU: {} for training".format(args.gpu))
 
@@ -137,6 +147,10 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         print("=> creating model '{}'".format(args.arch))
         model = models.__dict__[args.arch]()
+
+    if args.arch == "resnet18":
+        print("output: 200")
+        model = models.resnet18(num_classes=200)
 
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
@@ -177,7 +191,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                 weight_decay=args.weight_decay)
     
     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-    scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
+    scheduler = StepLR(optimizer, step_size=30, gamma=1)
     
     # optionally resume from a checkpoint
     if args.resume:
@@ -197,6 +211,7 @@ def main_worker(gpu, ngpus_per_node, args):
             model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             scheduler.load_state_dict(checkpoint['scheduler'])
+            writer.resume(checkpoint['writer'])
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
         else:
@@ -213,7 +228,7 @@ def main_worker(gpu, ngpus_per_node, args):
     train_dataset = datasets.ImageFolder(
         traindir,
         transforms.Compose([
-            transforms.RandomResizedCrop(224),
+            transforms.RandomResizedCrop(64, (args.scale, 1)),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             normalize,
@@ -230,8 +245,6 @@ def main_worker(gpu, ngpus_per_node, args):
 
     val_loader = torch.utils.data.DataLoader(
         datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
             transforms.ToTensor(),
             normalize,
         ])),
@@ -239,7 +252,7 @@ def main_worker(gpu, ngpus_per_node, args):
         num_workers=args.workers, pin_memory=True)
 
     if args.evaluate:
-        validate(val_loader, model, criterion, args)
+        validate(val_loader, model, criterion, args, writer)
         return
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -247,10 +260,10 @@ def main_worker(gpu, ngpus_per_node, args):
             train_sampler.set_epoch(epoch)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        train(train_loader, model, criterion, optimizer, epoch, args, writer)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        acc1 = validate(val_loader, model, criterion, args, writer)
         
         scheduler.step()
 
@@ -267,11 +280,23 @@ def main_worker(gpu, ngpus_per_node, args):
                 'state_dict': model.state_dict(),
                 'best_acc1': best_acc1,
                 'optimizer' : optimizer.state_dict(),
-                'scheduler' : scheduler.state_dict()
+                'scheduler' : scheduler.state_dict(),
+                'writer': writer.save_dict
             }, is_best)
+            if (epoch + 1) % args.save_freq == 0:
+                torch.save({
+                    'epoch': epoch + 1,
+                    'arch': args.arch,
+                    'state_dict': model.state_dict(),
+                    'best_acc1': best_acc1,
+                    'optimizer' : optimizer.state_dict(),
+                    'scheduler' : scheduler.state_dict(),
+                    'writer': writer.save_dict
+                }, f'{args.save_dir}/checkpoint_{epoch}.pth.tar')
 
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+
+def train(train_loader, model, criterion, optimizer, epoch, args, writer):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -316,9 +341,12 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
+            writer.write("Train", Loss=losses.val, Acc1=top1.val, Acc5=top5.val)
+
+        writer.write("Train_Avg", Loss=losses.avg, Acc1=top1.avg, Acc5=top5.avg)
 
 
-def validate(val_loader, model, criterion, args):
+def validate(val_loader, model, criterion, args, writer):
     batch_time = AverageMeter('Time', ':6.3f', Summary.NONE)
     losses = AverageMeter('Loss', ':.4e', Summary.NONE)
     top1 = AverageMeter('Acc@1', ':6.2f', Summary.AVERAGE)
@@ -355,8 +383,10 @@ def validate(val_loader, model, criterion, args):
 
             if i % args.print_freq == 0:
                 progress.display(i)
+                writer.write("Validate", Loss=losses.val, Acc1=top1.val, Acc5=top5.val)
 
         progress.display_summary()
+        writer.write("Validate_Avg", Loss=losses.avg, Acc1=top1.avg, Acc5=top5.avg)
 
     return top1.avg
 
@@ -438,7 +468,12 @@ def accuracy(output, target, topk=(1,)):
     with torch.no_grad():
         maxk = max(topk)
         batch_size = target.size(0)
-
+        _, pred = output.topk(1, 1, True, True)
+        global count
+        if count < 50:
+            for i in pred:
+                count+=1
+                print(i.item())
         _, pred = output.topk(maxk, 1, True, True)
         pred = pred.t()
         correct = pred.eq(target.view(1, -1).expand_as(pred))
@@ -449,6 +484,36 @@ def accuracy(output, target, topk=(1,)):
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
+class Writer:
+    def __init__(self,log_dir=None):
+        self.writer = SummaryWriter(log_dir)
+        self.data = {}
+        self.counts_dict = {}
+
+    def write(self, tag, **kwargs):
+        i = self.counts_dict[tag] if tag in self.counts_dict else 0
+        for key, value in kwargs.items():
+            self.writer.add_scalar(f'{tag}/{key}', value, i)
+            if f'{tag}/{key}' not in self.data:
+                self.data[f'{tag}/{key}'] = []
+            self.data[f'{tag}/{key}'].append(value)
+        self.counts_dict[tag] = i + 1
+
+    @property
+    def save_dict(self):
+        dic = {'counts_dict': self.counts_dict.copy(),
+                'data': self.data.copy()}
+        return dic
+    def resume(self, save_dict):
+        self.counts_dict = save_dict['counts_dict']
+        self.data = save_dict['data']
+        for tag,values in self.data.items():
+            for i,value in enumerate(values):
+                self.writer.add_scalar(tag, value, i)
+
+    def __del__(self):
+        self.writer.close()
 
 if __name__ == '__main__':
+    count = 0
     main()
